@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Market Sentinel — Control Plane</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+  <header>
+    <div>
+      <h1>Market Sentinel</h1>
+      <small style="color: #94a3b8;">Personal Market Intelligence Platform — Automatic Ingestion Engine</small>
+    </div>
+    <span class="status-active">● Auto-Scheduler Running</span>
+  </header>
+
+  <nav class="nav-tabs">
+    <button class="tab-btn active" onclick="switchTab('inbox')">Events Feed</button>
+    <button class="tab-btn" onclick="switchTab('sources')">Source Manager</button>
+    <button class="tab-btn" onclick="switchTab('settings')">Settings</button>
+  </nav>
+
+  <div class="main-container">
+
+    <!-- TAB 1: EVENTS FEED WITH ACTIVE FOLDER HIGHLIGHTING -->
+    <div id="inbox-tab" class="tab-content active">
+      <input type="text" id="search-input" class="search-box" placeholder="Search events by headline, text, or source..." oninput="fetchEvents()">
+      
+      <div class="filter-row">
+        <button id="folder-all" class="folder-btn active-folder" onclick="filterEvents('all')">🌐 All Items</button>
+        <button id="folder-unread" class="folder-btn" onclick="filterEvents('unread')">📩 Unread</button>
+        <button id="folder-starred" class="folder-btn" onclick="filterEvents('starred')">★ Starred</button>
+        <button id="folder-archived" class="folder-btn" onclick="filterEvents('archived')">📦 Archive</button>
+
+        <select id="feed-category-filter" class="form-control" style="width: 180px;" onchange="fetchEvents()">
+          <option value="all">All Categories</option>
+        </select>
+
+        <select id="feed-source-filter" class="form-control" style="width: 180px;" onchange="fetchEvents()">
+          <option value="all">All Sources</option>
+        </select>
+
+        <select id="feed-sort" class="form-control" style="width: 160px;" onchange="fetchEvents()">
+          <option value="newest">Newest First</option>
+          <option value="oldest">Oldest First</option>
+          <option value="title_asc">Title (A-Z)</option>
+        </select>
+      </div>
+
+      <div id="events-list">Loading events...</div>
+    </div>
+
+    <!-- TAB 2: SOURCE MANAGER -->
+    <div id="sources-tab" class="tab-content">
+      
+      <div class="form-card">
+        <h3 id="form-title" style="margin-top: 0; color: var(--accent);">➕ Add New Source</h3>
+        <form id="source-form" onsubmit="handleSourceSubmit(event)">
+          <input type="hidden" id="edit-source-id">
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+            <div class="form-group">
+              <label>Source Title / Name</label>
+              <input type="text" id="source-name" class="form-control" placeholder="e.g. Federal Reserve Press Releases" required>
+            </div>
+            <div class="form-group">
+              <label>Website / Feed URL</label>
+              <input type="text" id="source-url" class="form-control" placeholder="e.g. https://www.federalreserve.gov/feeds/press_all.xml" required>
+            </div>
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem;">
+            <div class="form-group">
+              <label>Source Type</label>
+              <select id="source-type" class="form-control">
+                <option value="auto">✨ Auto-Detect (All Types)</option>
+                <option value="rss">RSS / Atom Feed</option>
+                <option value="api">REST API</option>
+                <option value="json">JSON Feed</option>
+                <option value="xml">XML Feed</option>
+                <option value="html_article">HTML Article</option>
+                <option value="html_listing">HTML Listing Page</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label>Auto-Fetch Interval (Min : Sec)</label>
+              <div class="time-inputs">
+                <input type="number" id="source-min" class="form-control" placeholder="Min" min="0" value="5" required> :
+                <input type="number" id="source-sec" class="form-control" placeholder="Sec" min="0" max="59" value="0" required>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label>Category</label>
+              <select id="source-category" class="form-control" onchange="handleCategoryChange(this)">
+                <option value="">Loading categories...</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="custom-category-group" class="form-group" style="display: none;">
+            <label>New Custom Category Name</label>
+            <input type="text" id="custom-category-name" class="form-control" placeholder="e.g. Energy Markets">
+          </div>
+
+          <div style="display: flex; gap: 0.5rem; margin-top: 1rem;">
+            <button type="submit" id="submit-btn" class="btn btn-primary">+ Add Source & Start Auto-Fetching</button>
+            <button type="button" id="cancel-btn" class="btn" style="display: none;" onclick="resetForm()">Cancel Edit</button>
+          </div>
+        </form>
+      </div>
+
+      <h3 style="color: var(--accent);">Monitored Sources</h3>
+      <table id="sources-table">
+        <thead>
+          <tr>
+            <th>Source Name & URL</th>
+            <th>Type</th>
+            <th>Next Auto-Check (Countdown)</th>
+            <th>Status</th>
+            <th>Last Checked</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="sources-body">
+          <tr><td colspan="6">Loading sources...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- TAB 3: SETTINGS -->
+    <div id="settings-tab" class="tab-content">
+      <h2 style="color: var(--accent);">Notification & Alert Preferences</h2>
+      <div class="form-card">
+        <form onsubmit="saveSettings(event)">
+          <div class="checkbox-group">
+            <input type="checkbox" id="telegram-enabled">
+            <label for="telegram-enabled" style="color: var(--text); cursor: pointer;">Enable Telegram Bot Alerts</label>
+          </div>
+
+          <div class="form-group">
+            <label>Telegram Chat ID</label>
+            <input type="text" id="telegram-chat-id" class="form-control" placeholder="e.g. 123456789 or -1001234567890">
+          </div>
+
+          <hr style="border-color: var(--border); margin: 1.5rem 0;">
+
+          <div class="checkbox-group">
+            <input type="checkbox" id="email-enabled">
+            <label for="email-enabled" style="color: var(--text); cursor: pointer;">Enable Email Alerts (Resend)</label>
+          </div>
+
+          <div class="form-group">
+            <label>Recipient Email Address</label>
+            <input type="email" id="recipient-email" class="form-control" placeholder="e.g. user@example.com">
+          </div>
+
+          <hr style="border-color: var(--border); margin: 1.5rem 0;">
+
+          <div class="checkbox-group">
+            <input type="checkbox" id="notify-empty">
+            <label for="notify-empty" style="color: var(--text); cursor: pointer;">Send notification when 0 new events are found (Status Check Alerts)</label>
+          </div>
+
+          <hr style="border-color: var(--border); margin: 1.5rem 0;">
+
+          <div class="checkbox-group">
+            <input type="checkbox" id="dedup-enabled">
+            <label for="dedup-enabled" style="color: var(--text); cursor: pointer;">Enable Phase 1 Deduplication (SHA-256 Filter)</label>
+          </div>
+
+          <div class="checkbox-group">
+            <input type="checkbox" id="toast-enabled">
+            <label for="toast-enabled" style="color: var(--text); cursor: pointer;">Enable UI Toast Notifications (Bottom Corner Banners)</label>
+          </div>
+
+          <button type="submit" class="btn btn-primary" style="margin-top: 1rem;">Save Preferences</button>
+        </form>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>

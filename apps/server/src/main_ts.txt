@@ -1,0 +1,1168 @@
+import express from 'express';
+import session from 'express-session';
+import dotenv from 'dotenv';
+import path from 'path';
+import crypto from 'crypto';
+import { PrismaClient } from '@prisma/client';
+
+dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
+
+// --- CRASH PREVENTION HANDLERS ---
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ [Uncaught Exception Prevented]:', err.message || err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ [Unhandled Rejection Prevented]:', reason);
+});
+
+const app = express();
+const prisma = new PrismaClient();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || 'fallback-secret-key',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 },
+  })
+);
+
+// --- SAFE STRING CLEANER HELPER ---
+function cleanHtmlText(input: any): string {
+  if (!input) return '';
+  let str = '';
+  if (Array.isArray(input)) {
+    str = String(input || input[0] || '');
+  } else {
+    str = String(input);
+  }
+  return str.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+}
+
+// --- SAFE FETCH WRAPPER ---
+async function safeFetchText(url: string, sourceName: string, headers: Record<string, string> = {}) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        ...headers,
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      console.log(`⚠️ [Fetch Error Debug] Source: "${sourceName}" (${url}) -> HTTP ${res.status} ${res.statusText}`);
+      return null;
+    }
+    return await res.text();
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      console.log(`⚠️ [Fetch Timeout Debug] Source: "${sourceName}" (${url}) -> Request timed out after 10 seconds.`);
+    } else {
+      console.log(`⚠️ [Fetch Network Error Debug] Source: "${sourceName}" (${url}) -> ${err.message || err}`);
+    }
+    return null;
+  }
+}
+
+// --- TELEGRAM NOTIFICATION DISPATCHER ---
+async function sendTelegramNotification(text: string) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const settings = await prisma.settings.findUnique({ where: { id: 1 } });
+
+  if (!settings?.telegramEnabled) return;
+  const chatId = settings?.telegramChatId || process.env.TELEGRAM_CHAT_ID;
+
+  if (!token || token.includes('your_telegram_bot_token') || !chatId) return;
+
+  try {
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: false }),
+    });
+    const data = await res.json();
+    if (data.ok) console.log(`✅ [Telegram Success] Alert sent to Chat ID: ${chatId}`);
+    else console.error(`❌ [Telegram Error]: ${data.description}`);
+  } catch (err) {
+    console.error('❌ [Telegram Error]:', err);
+  }
+}
+
+// --- EMAIL NOTIFICATION DISPATCHER (RESEND API) ---
+async function sendEmailNotification(subject: string, htmlContent: string) {
+  const apiKey = process.env.RESEND_API_KEY;
+  const settings = await prisma.settings.findUnique({ where: { id: 1 } });
+
+  if (!settings?.emailEnabled) return;
+
+  const recipient = settings?.recipientEmail;
+
+  if (!apiKey || apiKey.includes('re_123456789') || !recipient) {
+    console.log('⚠️ [Email Warning] RESEND_API_KEY or recipient email missing in .env / Settings.');
+    return;
+  }
+
+  console.log(`📧 [EMAIL DISPATCH] Sending email alert to: ${recipient}...`);
+
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: 'Market Sentinel <onboarding@resend.dev>',
+        to: [recipient],
+        subject: subject,
+        html: `<div style="font-family: system-ui, sans-serif; padding: 20px; background: #0f172a; color: #f8fafc; border-radius: 8px;">
+                <h2 style="color: #38bdf8; margin-top: 0;">Market Sentinel Alert</h2>
+                <div style="font-size: 1rem; line-height: 1.6;">${htmlContent}</div>
+                <hr style="border-color: #334155; margin: 20px 0;">
+                <small style="color: #94a3b8;">Automated Market Intelligence Notification</small>
+               </div>`,
+      }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      console.log(`✅ [Email Success] Alert delivered via Resend to: ${recipient}`);
+    } else {
+      console.error(`❌ [Email Error from Resend API]:`, data);
+    }
+  } catch (err) {
+    console.error('❌ [Email Error]:', err);
+  }
+}
+
+// --- CONTENT EXTRACTION ENGINE ---
+async function processAndIngestSource(source: any, triggerMode: 'AUTO' | 'MANUAL' = 'AUTO') {
+  console.log(`🔍 [${triggerMode} FETCH] Scraping content for: ${source.name} (${source.url})`);
+  
+  const settings = await prisma.settings.findUnique({ where: { id: 1 } });
+  const isDedupEnabled = settings?.deduplicationEnabled ?? true;
+
+  const rawText = await safeFetchText(source.url, source.name);
+  if (!rawText) return 0;
+
+  const items: Array<{ title: string; link: string; snippet: string }> = [];
+
+  const titleMatch = rawText.match(/<title[^>]*>(.*?)<\/title>/i);
+  let title = cleanHtmlText(titleMatch) || source.name;
+
+  const metaDescMatch = rawText.match(/<meta[^>]*name=["']description["'][^>]*content=["'](.*?)["']/i) ||
+                        rawText.match(/<meta[^>]*property=["']og:description["'][^>]*content=["'](.*?)["']/i);
+  
+  let snippet = cleanHtmlText(metaDescMatch);
+
+  if (!snippet) {
+    const pMatch = rawText.match(/<p[^>]*>(.*?)<\/p>/gi);
+    if (pMatch && pMatch.length > 0) {
+      const cleanP = cleanHtmlText(pMatch[0]);
+      if (cleanP.length > 15) snippet = cleanP.substring(0, 250) + '...';
+    }
+  }
+
+  if (!snippet) snippet = 'New headline detected on source page.';
+
+  const itemLink = source.url;
+
+  items.push({
+    title: title.length > 100 ? title.substring(0, 100) + '...' : title,
+    link: itemLink,
+    snippet: snippet,
+  });
+
+  let newEventCount = 0;
+
+  for (const item of items) {
+    let hashInput = `${item.title}-${item.link}`;
+    if (!isDedupEnabled) {
+      hashInput += `-${Date.now()}-${Math.random()}`;
+    }
+
+    const contentHash = crypto.createHash('sha256').update(hashInput).digest('hex');
+
+    let isDuplicate = false;
+    if (isDedupEnabled) {
+      const existing = await prisma.event.findFirst({
+        where: { sourceId: source.id, contentHash: contentHash },
+      });
+      if (existing) isDuplicate = true;
+    }
+
+    if (!isDuplicate) {
+      try {
+        await prisma.event.create({
+          data: {
+            sourceId: source.id,
+            categoryId: source.categoryId,
+            title: item.title,
+            description: item.snippet,
+            originalContent: item.snippet,
+            directLink: item.link,
+            contentHash: contentHash,
+            publishedAt: new Date(),
+          },
+        });
+
+        newEventCount++;
+
+        const telegramHtml = `
+📰 <b>${item.title}</b>
+<i>Source: ${source.name} (${triggerMode} CHECK)</i>
+
+📝 <b>Preview / Starting Lines:</b>
+${item.snippet}
+
+🔗 <a href="${item.link}">Read Specific Article / Event ↗</a>
+🌐 <a href="${source.url}">Main Source Portal</a>
+        `;
+
+        const emailHtml = `
+          <p><strong>${item.title}</strong></p>
+          <p><em>Source: ${source.name} (${triggerMode} CHECK)</em></p>
+          <p><strong>Preview:</strong> ${item.snippet}</p>
+          <p><a href="${item.link}" style="color: #38bdf8; font-weight: bold;">🔗 Read Specific Article / Event ↗</a></p>
+        `;
+
+        await sendTelegramNotification(telegramHtml);
+        await sendEmailNotification(`Market Sentinel Alert: ${item.title}`, emailHtml);
+      } catch (dbErr: any) {
+        if (dbErr?.code === 'P2002') {
+          console.log(`ℹ️ [DEDUP FILTER] Skipped duplicate item for ${source.name}`);
+        } else {
+          console.error(`❌ [Database Error]:`, dbErr.message || dbErr);
+        }
+      }
+    } else {
+      console.log(`ℹ️ [DEDUP FILTER] Skipped duplicate item for ${source.name}`);
+    }
+  }
+
+  // STATUS NOTIFICATION FOR 0 NEW EVENTS (WORKS FOR BOTH MANUAL AND AUTO)
+  if (newEventCount === 0 && (settings as any)?.notifyWhenEmpty) {
+    const emptyMsg = `Status Check Complete for source "${source.name}" (${triggerMode} CHECK). Result: 0 new events.`;
+    await sendTelegramNotification(`🔔 <b>Market Sentinel Status Alert (${triggerMode})</b>\nSource: <b>${source.name}</b>\nResult: 0 new events detected.`);
+    await sendEmailNotification(`Market Sentinel Status (${triggerMode}): ${source.name}`, emptyMsg);
+  }
+
+  console.log(`📊 [INGESTION STATS] ${source.name} | Mode: ${triggerMode} | New Events Ingested: ${newEventCount}`);
+  return newEventCount;
+}
+
+// --- AUTOMATIC BACKGROUND SCHEDULER ENGINE ---
+setInterval(async () => {
+  try {
+    const activeSources = await prisma.source.findMany({
+      where: { status: 'active' },
+    });
+
+    const now = new Date();
+
+    for (const source of activeSources) {
+      const lastCheck = source.lastSuccessAt ? new Date(source.lastSuccessAt).getTime() : 0;
+      const intervalMs = (source.checkIntervalSec || 300) * 1000;
+
+      if (now.getTime() - lastCheck >= intervalMs) {
+        console.log(`⏰ [AUTO SCHEDULER] Scheduled check: ${source.name}`);
+        await processAndIngestSource(source, 'AUTO');
+
+        await prisma.source.update({
+          where: { id: source.id },
+          data: { lastSuccessAt: now, consecutiveFailures: 0 },
+        });
+      }
+    }
+  } catch (err) {
+    console.error('[Auto-Scheduler Error]:', err);
+  }
+}, 3000);
+
+// --- REST API ENDPOINTS ---
+
+app.get('/api/categories', async (req, res) => {
+  try {
+    const categories = await prisma.category.findMany({ orderBy: { name: 'asc' } });
+    res.json(categories);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch categories' });
+  }
+});
+
+app.post('/api/categories', async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: 'Category name required' });
+
+    const newCategory = await prisma.category.upsert({
+      where: { name },
+      update: {},
+      create: { name },
+    });
+    console.log(`➕ [CATEGORY CREATED] Name: ${name}`);
+    res.status(201).json(newCategory);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create category' });
+  }
+});
+
+// GET /api/events - Filtered by Folder Tabs (Unread, Starred, Archived, All)
+app.get('/api/events', async (req, res) => {
+  try {
+    const { status, search, categoryId, sourceId, sort } = req.query;
+    let where: any = {};
+
+    if (status === 'unread') {
+      where.isRead = false;
+      where.isArchived = false;
+    } else if (status === 'starred') {
+      where.isStarred = true;
+      where.isArchived = false;
+    } else if (status === 'archived') {
+      where.isArchived = true;
+    } else {
+      // 'all' folder tab shows all active non-archived events
+      where.isArchived = false;
+    }
+
+    if (categoryId && typeof categoryId === 'string' && categoryId !== 'all') {
+      where.categoryId = categoryId;
+    }
+
+    if (sourceId && typeof sourceId === 'string' && sourceId !== 'all') {
+      where.sourceId = sourceId;
+    }
+
+    if (search && typeof search === 'string') {
+      where.OR = [
+        { title: { contains: search, mode: 'insensitive' } },
+        { description: { contains: search, mode: 'insensitive' } },
+      ];
+    }
+
+    let orderBy: any = { publishedAt: 'desc' };
+    if (sort === 'oldest') orderBy = { publishedAt: 'asc' };
+    if (sort === 'title_asc') orderBy = { title: 'asc' };
+
+    const events = await prisma.event.findMany({
+      where,
+      include: { source: true, category: true },
+      orderBy,
+      take: 50,
+    });
+
+    res.json(events);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch events' });
+  }
+});
+
+app.patch('/api/events/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isRead, isStarred, isArchived } = req.body;
+
+    const updated = await prisma.event.update({
+      where: { id },
+      data: {
+        ...(isRead !== undefined && { isRead }),
+        ...(isStarred !== undefined && { isStarred }),
+        ...(isArchived !== undefined && { isArchived }),
+      },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update event' });
+  }
+});
+
+app.get('/api/sources', async (req, res) => {
+  try {
+    const sources = await prisma.source.findMany({
+      include: { category: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(sources);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch sources' });
+  }
+});
+
+app.post('/api/sources', async (req, res) => {
+  try {
+    const { name, url, type, categoryId, checkIntervalSec } = req.body;
+
+    if (!name || !url) {
+      return res.status(400).json({ error: 'Title and URL are required' });
+    }
+
+    let targetCategory = categoryId;
+    if (!targetCategory) {
+      const def = await prisma.category.findFirst();
+      targetCategory = def ? def.id : (await prisma.category.create({ data: { name: 'General' } })).id;
+    }
+
+    const newSource = await prisma.source.create({
+      data: {
+        name,
+        url,
+        type: type || 'auto',
+        categoryId: targetCategory,
+        checkIntervalSec: parseInt(checkIntervalSec) || 300,
+        status: 'active',
+      },
+    });
+
+    console.log(`➕ [SOURCE ADDED] Name: "${name}" | URL: ${url} | Type: ${type} | Interval: ${checkIntervalSec}s`);
+    res.status(201).json(newSource);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create source' });
+  }
+});
+
+app.put('/api/sources/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, url, type, categoryId, checkIntervalSec, status } = req.body;
+
+    const updated = await prisma.source.update({
+      where: { id },
+      data: {
+        ...(name && { name }),
+        ...(url && { url }),
+        ...(type && { type: type || 'auto' }),
+        ...(categoryId && { categoryId }),
+        ...(checkIntervalSec && { checkIntervalSec: parseInt(checkIntervalSec) }),
+        ...(status && { status }),
+      },
+    });
+
+    console.log(`✏️ [SOURCE EDITED] ID: ${id} | Name: "${updated.name}" | Interval: ${updated.checkIntervalSec}s`);
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update source' });
+  }
+});
+
+app.patch('/api/sources/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    const updated = await prisma.source.update({
+      where: { id },
+      data: { status },
+    });
+
+    console.log(`🔄 [SOURCE STATUS CHANGED] ${updated.name} -> ${updated.status.toUpperCase()}`);
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update source status' });
+  }
+});
+
+app.delete('/api/sources/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.event.deleteMany({ where: { sourceId: id } });
+    await prisma.fetchLog.deleteMany({ where: { sourceId: id } });
+    await prisma.source.delete({ where: { id } });
+    console.log(`🗑️ [SOURCE DELETED] ID: ${id}`);
+    res.json({ message: 'Source deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete source' });
+  }
+});
+
+app.post('/api/sources/:id/trigger', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const source = await prisma.source.findUnique({ where: { id } });
+
+    if (!source) return res.status(404).json({ error: 'Source not found' });
+
+    console.log(`⚡ [MANUAL FETCH TRIGGERED] User initiated check for: ${source.name}`);
+    const newEventsCount = await processAndIngestSource(source, 'MANUAL');
+
+    await prisma.source.update({
+      where: { id },
+      data: { lastSuccessAt: new Date(), consecutiveFailures: 0, status: 'active' },
+    });
+
+    res.json({ message: 'Source check triggered', newEventsCount });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to trigger source' });
+  }
+});
+
+app.get('/api/settings', async (req, res) => {
+  try {
+    let settings = await prisma.settings.findUnique({ where: { id: 1 } });
+    if (!settings) {
+      settings = await prisma.settings.create({ data: { id: 1 } });
+    }
+    res.json(settings);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch settings' });
+  }
+});
+
+app.put('/api/settings', async (req, res) => {
+  try {
+    const { telegramEnabled, emailEnabled, notifyWhenEmpty, deduplicationEnabled, showToastAlerts, telegramChatId, recipientEmail } = req.body;
+
+    const updated = await prisma.settings.upsert({
+      where: { id: 1 },
+      update: {
+        telegramEnabled: Boolean(telegramEnabled),
+        emailEnabled: Boolean(emailEnabled),
+        notifyWhenEmpty: Boolean(notifyWhenEmpty),
+        deduplicationEnabled: Boolean(deduplicationEnabled),
+        showToastAlerts: Boolean(showToastAlerts),
+        telegramChatId,
+        recipientEmail,
+      },
+      create: {
+        id: 1,
+        telegramEnabled: Boolean(telegramEnabled),
+        emailEnabled: Boolean(emailEnabled),
+        notifyWhenEmpty: Boolean(notifyWhenEmpty),
+        deduplicationEnabled: Boolean(deduplicationEnabled),
+        showToastAlerts: Boolean(showToastAlerts),
+        telegramChatId,
+        recipientEmail,
+      },
+    });
+
+    console.log(`⚙️ [SETTINGS SAVED] Telegram: ${telegramEnabled} | Email: ${emailEnabled} | Recipient: "${recipientEmail || 'N/A'}" | Dedup: ${deduplicationEnabled}`);
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update settings' });
+  }
+});
+
+// --- DASHBOARD UI ---
+
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Market Sentinel — Control Plane</title>
+      <style>
+        :root { --bg: #0f172a; --panel: #1e293b; --card: #334155; --text: #f8fafc; --accent: #38bdf8; --border: #475569; }
+        * { user-select: text !important; -webkit-user-select: text !important; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; }
+        header { background: var(--panel); border-bottom: 1px solid var(--border); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
+        h1 { margin: 0; font-size: 1.5rem; color: var(--accent); }
+        .nav-tabs { display: flex; gap: 1rem; margin-top: 1rem; background: var(--panel); padding: 0.5rem 2rem; border-bottom: 1px solid var(--border); }
+        .tab-btn { background: none; border: none; color: #94a3b8; padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; border-radius: 6px; }
+        .tab-btn.active { background: var(--accent); color: #0f172a; font-weight: bold; }
+        .main-container { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .search-box { width: 100%; padding: 0.75rem; border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); font-size: 1rem; margin-bottom: 1rem; box-sizing: border-box; }
+        .filter-row { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1.5rem; align-items: center; }
+        .folder-btn { background: var(--card); border: 1px solid var(--border); color: #94a3b8; padding: 0.45rem 1rem; border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 500; }
+        .folder-btn.active-folder { background: #0284c7; color: white; border-color: #38bdf8; font-weight: bold; }
+        .event-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1rem; }
+        .event-title-link { color: var(--accent); text-decoration: none; font-size: 1.15rem; font-weight: bold; }
+        .event-title-link:hover { text-decoration: underline; }
+        .badge { background: #0284c7; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; text-transform: uppercase; }
+        .badge-auto { background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; text-transform: uppercase; }
+        .actions { display: flex; gap: 0.5rem; margin-top: 1rem; flex-wrap: wrap; }
+        .btn { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 0.4rem 0.8rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+        .btn-primary { background: #0284c7; color: white; border: none; padding: 0.6rem 1.2rem; font-weight: bold; }
+        .btn-warning { background: #eab308; color: #0f172a; border: none; font-weight: bold; }
+        .btn-success { background: #22c55e; color: #0f172a; border: none; font-weight: bold; }
+        .btn-danger { background: #ef4444; color: white; border: none; }
+        .btn:hover, .btn-primary:hover { opacity: 0.9; }
+        table { width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 8px; overflow: hidden; margin-top: 1rem; }
+        th, td { padding: 0.85rem; text-align: left; border-bottom: 1px solid var(--border); }
+        th { background: #0284c7; color: white; }
+        .form-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin-bottom: 2rem; }
+        .form-group { margin-bottom: 1rem; }
+        .form-group label { display: block; margin-bottom: 0.4rem; color: var(--accent); font-weight: bold; font-size: 0.9rem; }
+        .form-control { width: 100%; padding: 0.6rem; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); box-sizing: border-box; user-select: text !important; }
+        .checkbox-group { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem; }
+        .checkbox-group input { width: 18px; height: 18px; cursor: pointer; }
+        .status-active { color: #4ade80; font-weight: bold; }
+        .status-paused { color: #facc15; font-weight: bold; }
+        .status-error { color: #f87171; font-weight: bold; }
+        .time-inputs { display: flex; align-items: center; gap: 0.5rem; }
+        .time-inputs input { width: 80px; text-align: center; }
+
+        .toast {
+          position: fixed;
+          bottom: 20px;
+          right: 20px;
+          background: #0284c7;
+          color: white;
+          padding: 12px 20px;
+          border-radius: 8px;
+          font-weight: bold;
+          box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+          z-index: 9999;
+          transition: opacity 0.4s ease;
+        }
+        .toast.fade-out { opacity: 0; }
+      </style>
+    </head>
+    <body>
+
+      <header>
+        <div>
+          <h1>Market Sentinel</h1>
+          <small style="color: #94a3b8;">Personal Market Intelligence Platform — Automatic Ingestion Engine</small>
+        </div>
+        <span class="status-active">● Auto-Scheduler Running</span>
+      </header>
+
+      <nav class="nav-tabs">
+        <button class="tab-btn active" onclick="switchTab('inbox')">Events Feed</button>
+        <button class="tab-btn" onclick="switchTab('sources')">Source Manager</button>
+        <button class="tab-btn" onclick="switchTab('settings')">Settings</button>
+      </nav>
+
+      <div class="main-container">
+
+        <!-- TAB 1: EVENTS FEED WITH ACTIVE FOLDER HIGHLIGHTING -->
+        <div id="inbox-tab" class="tab-content active">
+          <input type="text" id="search-input" class="search-box" placeholder="Search events by headline, text, or source..." oninput="fetchEvents()">
+          
+          <div class="filter-row">
+            <button id="folder-all" class="folder-btn active-folder" onclick="filterEvents('all')">🌐 All Items</button>
+            <button id="folder-unread" class="folder-btn" onclick="filterEvents('unread')">📩 Unread</button>
+            <button id="folder-starred" class="folder-btn" onclick="filterEvents('starred')">★ Starred</button>
+            <button id="folder-archived" class="folder-btn" onclick="filterEvents('archived')">📦 Archive</button>
+
+            <select id="feed-category-filter" class="form-control" style="width: 180px;" onchange="fetchEvents()">
+              <option value="all">All Categories</option>
+            </select>
+
+            <select id="feed-source-filter" class="form-control" style="width: 180px;" onchange="fetchEvents()">
+              <option value="all">All Sources</option>
+            </select>
+
+            <select id="feed-sort" class="form-control" style="width: 160px;" onchange="fetchEvents()">
+              <option value="newest">Newest First</option>
+              <option value="oldest">Oldest First</option>
+              <option value="title_asc">Title (A-Z)</option>
+            </select>
+          </div>
+
+          <div id="events-list">Loading events...</div>
+        </div>
+
+        <!-- TAB 2: SOURCE MANAGER -->
+        <div id="sources-tab" class="tab-content">
+          
+          <div class="form-card">
+            <h3 id="form-title" style="margin-top: 0; color: var(--accent);">➕ Add New Source</h3>
+            <form id="source-form" onsubmit="handleSourceSubmit(event)">
+              <input type="hidden" id="edit-source-id">
+
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                <div class="form-group">
+                  <label>Source Title / Name</label>
+                  <input type="text" id="source-name" class="form-control" placeholder="e.g. Federal Reserve Press Releases" required>
+                </div>
+                <div class="form-group">
+                  <label>Website / Feed URL</label>
+                  <input type="text" id="source-url" class="form-control" placeholder="e.g. https://www.federalreserve.gov/feeds/press_all.xml" required>
+                </div>
+              </div>
+
+              <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem;">
+                <div class="form-group">
+                  <label>Source Type</label>
+                  <select id="source-type" class="form-control">
+                    <option value="auto">✨ Auto-Detect (All Types)</option>
+                    <option value="rss">RSS / Atom Feed</option>
+                    <option value="api">REST API</option>
+                    <option value="json">JSON Feed</option>
+                    <option value="xml">XML Feed</option>
+                    <option value="html_article">HTML Article</option>
+                    <option value="html_listing">HTML Listing Page</option>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label>Auto-Fetch Interval (Min : Sec)</label>
+                  <div class="time-inputs">
+                    <input type="number" id="source-min" class="form-control" placeholder="Min" min="0" value="5" required> :
+                    <input type="number" id="source-sec" class="form-control" placeholder="Sec" min="0" max="59" value="0" required>
+                  </div>
+                </div>
+
+                <div class="form-group">
+                  <label>Category</label>
+                  <select id="source-category" class="form-control" onchange="handleCategoryChange(this)">
+                    <option value="">Loading categories...</option>
+                  </select>
+                </div>
+              </div>
+
+              <div id="custom-category-group" class="form-group" style="display: none;">
+                <label>New Custom Category Name</label>
+                <input type="text" id="custom-category-name" class="form-control" placeholder="e.g. Energy Markets">
+              </div>
+
+              <div style="display: flex; gap: 0.5rem; margin-top: 1rem;">
+                <button type="submit" id="submit-btn" class="btn btn-primary">+ Add Source & Start Auto-Fetching</button>
+                <button type="button" id="cancel-btn" class="btn" style="display: none;" onclick="resetForm()">Cancel Edit</button>
+              </div>
+            </form>
+          </div>
+
+          <h3 style="color: var(--accent);">Monitored Sources</h3>
+          <table id="sources-table">
+            <thead>
+              <tr>
+                <th>Source Name & URL</th>
+                <th>Type</th>
+                <th>Next Auto-Check (Countdown)</th>
+                <th>Status</th>
+                <th>Last Checked</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="sources-body">
+              <tr><td colspan="6">Loading sources...</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- TAB 3: SETTINGS -->
+        <div id="settings-tab" class="tab-content">
+          <h2 style="color: var(--accent);">Notification & Alert Preferences</h2>
+          <div class="form-card">
+            <form onsubmit="saveSettings(event)">
+              <div class="checkbox-group">
+                <input type="checkbox" id="telegram-enabled">
+                <label for="telegram-enabled" style="color: var(--text); cursor: pointer;">Enable Telegram Bot Alerts</label>
+              </div>
+
+              <div class="form-group">
+                <label>Telegram Chat ID</label>
+                <input type="text" id="telegram-chat-id" class="form-control" placeholder="e.g. 123456789 or -1001234567890">
+              </div>
+
+              <hr style="border-color: var(--border); margin: 1.5rem 0;">
+
+              <div class="checkbox-group">
+                <input type="checkbox" id="email-enabled">
+                <label for="email-enabled" style="color: var(--text); cursor: pointer;">Enable Email Alerts (Resend)</label>
+              </div>
+
+              <div class="form-group">
+                <label>Recipient Email Address</label>
+                <input type="email" id="recipient-email" class="form-control" placeholder="e.g. user@example.com">
+              </div>
+
+              <hr style="border-color: var(--border); margin: 1.5rem 0;">
+
+              <div class="checkbox-group">
+                <input type="checkbox" id="notify-empty">
+                <label for="notify-empty" style="color: var(--text); cursor: pointer;">Send notification when 0 new events are found (Status Check Alerts)</label>
+              </div>
+
+              <hr style="border-color: var(--border); margin: 1.5rem 0;">
+
+              <div class="checkbox-group">
+                <input type="checkbox" id="dedup-enabled">
+                <label for="dedup-enabled" style="color: var(--text); cursor: pointer;">Enable Phase 1 Deduplication (SHA-256 Filter)</label>
+              </div>
+
+              <div class="checkbox-group">
+                <input type="checkbox" id="toast-enabled">
+                <label for="toast-enabled" style="color: var(--text); cursor: pointer;">Enable UI Toast Notifications (Bottom Corner Banners)</label>
+              </div>
+
+              <button type="submit" class="btn btn-primary" style="margin-top: 1rem;">Save Preferences</button>
+            </form>
+          </div>
+        </div>
+
+      </div>
+
+      <script>
+        let currentFilter = 'all';
+        let cachedSources = [];
+        let enableToastAlerts = true;
+
+        function formatDate(dateStr) {
+          if (!dateStr) return 'Pending';
+          const d = new Date(dateStr);
+          const day = String(d.getDate()).padStart(2, '0');
+          const month = String(d.getMonth() + 1).padStart(2, '0');
+          const year = d.getFullYear();
+          const hours = String(d.getHours()).padStart(2, '0');
+          const minutes = String(d.getMinutes()).padStart(2, '0');
+          const seconds = String(d.getSeconds()).padStart(2, '0');
+          return \`\${day}/\${month}/\${year}, \${hours}:\${minutes}:\${seconds}\`;
+        }
+
+        function notify(message) {
+          if (!enableToastAlerts) return;
+
+          const toast = document.createElement('div');
+          toast.className = 'toast';
+          toast.innerText = message;
+          document.body.appendChild(toast);
+
+          setTimeout(() => {
+            toast.classList.add('fade-out');
+            setTimeout(() => toast.remove(), 400);
+          }, 3000);
+        }
+
+        function updateCountdowns() {
+          const now = new Date().getTime();
+          cachedSources.forEach(s => {
+            const timerEl = document.getElementById('countdown-' + s.id);
+            if (!timerEl) return;
+
+            if (s.status === 'paused') {
+              timerEl.innerHTML = '<span class="status-paused">PAUSED</span>';
+              return;
+            }
+
+            const intervalMs = (s.checkIntervalSec || 300) * 1000;
+            const lastCheck = s.lastSuccessAt ? new Date(s.lastSuccessAt).getTime() : now;
+            const nextCheck = lastCheck + intervalMs;
+            const diffSec = Math.floor((nextCheck - now) / 1000);
+
+            if (diffSec <= 0) {
+              timerEl.innerHTML = '<span style="color: #38bdf8; font-weight: bold;">⚡ Checking now...</span>';
+            } else {
+              const min = Math.floor(diffSec / 60);
+              const sec = diffSec % 60;
+              const minStr = min < 10 ? '0' + min : min;
+              const secStr = sec < 10 ? '0' + sec : sec;
+              timerEl.innerHTML = \`⏳ <b>\${minStr}m \${secStr}s</b>\`;
+            }
+          });
+        }
+
+        setInterval(updateCountdowns, 1000);
+
+        function switchTab(tabName) {
+          document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+          document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+          
+          if (tabName === 'inbox') {
+            document.getElementById('inbox-tab').classList.add('active');
+            event.target.classList.add('active');
+            fetchEvents();
+            populateFeedFilters();
+          } else if (tabName === 'sources') {
+            document.getElementById('sources-tab').classList.add('active');
+            event.target.classList.add('active');
+            fetchSources();
+            fetchCategories();
+          } else if (tabName === 'settings') {
+            document.getElementById('settings-tab').classList.add('active');
+            event.target.classList.add('active');
+            fetchSettings();
+          }
+        }
+
+        async function populateFeedFilters() {
+          const catRes = await fetch('/api/categories');
+          const categories = await catRes.json();
+          const catSelect = document.getElementById('feed-category-filter');
+          if (Array.isArray(categories)) {
+            catSelect.innerHTML = '<option value="all">All Categories</option>' + 
+              categories.map(c => \`<option value="\${c.id}">\${c.name}</option>\`).join('');
+          }
+
+          const srcRes = await fetch('/api/sources');
+          const sources = await srcRes.json();
+          const srcSelect = document.getElementById('feed-source-filter');
+          if (Array.isArray(sources)) {
+            srcSelect.innerHTML = '<option value="all">All Sources</option>' + 
+              sources.map(s => \`<option value="\${s.id}">\${s.name}</option>\`).join('');
+          }
+        }
+
+        function filterEvents(folder) {
+          currentFilter = folder;
+          document.querySelectorAll('.folder-btn').forEach(btn => btn.classList.remove('active-folder'));
+          const activeBtn = document.getElementById('folder-' + folder);
+          if (activeBtn) activeBtn.classList.add('active-folder');
+          fetchEvents();
+        }
+
+        async function fetchEvents() {
+          const search = document.getElementById('search-input').value;
+          const categoryId = document.getElementById('feed-category-filter')?.value || 'all';
+          const sourceId = document.getElementById('feed-source-filter')?.value || 'all';
+          const sort = document.getElementById('feed-sort')?.value || 'newest';
+
+          const url = \`/api/events?status=\${currentFilter}&search=\${encodeURIComponent(search)}&categoryId=\${categoryId}&sourceId=\${sourceId}&sort=\${sort}\`;
+          const res = await fetch(url);
+          const events = await res.json();
+
+          const listEl = document.getElementById('events-list');
+          if (!Array.isArray(events) || events.length === 0) {
+            listEl.innerHTML = '<p style="color: #94a3b8; padding: 2rem 0; text-align: center;">No items inside this folder view.</p>';
+            return;
+          }
+
+          listEl.innerHTML = events.map(ev => \`
+            <div class="event-card">
+              <span class="badge">\${ev.source ? ev.source.name : 'SOURCE'}</span>
+              <h3 style="margin: 0.5rem 0;">
+                <a href="\${ev.directLink}" target="_blank" class="event-title-link">\${ev.title} ↗</a>
+              </h3>
+              <p style="color: #cbd5e1; font-size: 0.95rem; line-height: 1.5;">\${ev.description || ev.originalContent}</p>
+              <div style="color: #64748b; font-size: 0.8rem;">Published: \${formatDate(ev.publishedAt)}</div>
+              
+              <div class="actions">
+                <button class="btn \${ev.isStarred ? 'btn-warning' : ''}" onclick="toggleEvent('\${ev.id}', { isStarred: !\${ev.isStarred} })">\${ev.isStarred ? '★ Starred' : '☆ Star'}</button>
+                <button class="btn \${ev.isRead ? 'btn-success' : ''}" onclick="toggleEvent('\${ev.id}', { isRead: !\${ev.isRead} })">\${ev.isRead ? '✓ Read' : '✉ Mark Read'}</button>
+                <button class="btn" onclick="toggleEvent('\${ev.id}', { isArchived: !\${ev.isArchived} })">\${ev.isArchived ? '📂 Unarchive' : '📦 Archive'}</button>
+                <a href="\${ev.directLink}" target="_blank" class="btn btn-primary" style="text-decoration: none; display: inline-block;">🔗 Read Full Article ↗</a>
+              </div>
+            </div>
+          \`).join('');
+        }
+
+        async function toggleEvent(id, payload) {
+          await fetch('/api/events/' + id, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          notify('Item moved / state updated.');
+          fetchEvents();
+        }
+
+        async function fetchSources() {
+          const res = await fetch('/api/sources');
+          cachedSources = await res.json();
+
+          const bodyEl = document.getElementById('sources-body');
+          if (!Array.isArray(cachedSources) || cachedSources.length === 0) {
+            bodyEl.innerHTML = '<tr><td colspan="6">No sources added yet. Use the form above to add your first source!</td></tr>';
+            return;
+          }
+
+          bodyEl.innerHTML = cachedSources.map(s => {
+            const badgeClass = (s.type === 'auto' || !s.type) ? 'badge-auto' : 'badge';
+            const displayType = (s.type === 'auto' || !s.type) ? 'AUTO-DETECT' : s.type.toUpperCase();
+            const statusClass = s.status === 'active' ? 'status-active' : s.status === 'paused' ? 'status-paused' : 'status-error';
+
+            return \`
+              <tr>
+                <td><strong>\${s.name}</strong><br><small style="color: #94a3b8;">\${s.url}</small></td>
+                <td><span class="\${badgeClass}">\${displayType}</span></td>
+                <td><span id="countdown-\${s.id}">Calculating...</span></td>
+                <td class="\${statusClass}">\${s.status.toUpperCase()}</td>
+                <td>\${formatDate(s.lastSuccessAt)}</td>
+                <td>
+                  <button class="btn" onclick="triggerSource('\${s.id}')">Fetch Now</button>
+                  <button class="\${s.status === 'active' ? 'btn btn-warning' : 'btn btn-success'}" onclick="toggleSourceStatus('\${s.id}', '\${s.status}')">\${s.status === 'active' ? '⏸️ Pause' : '▶️ Activate'}</button>
+                  <button class="btn" onclick="editSource('\${s.id}')">✏️ Edit</button>
+                  <button class="btn btn-danger" onclick="deleteSource('\${s.id}')">🗑️ Delete</button>
+                </td>
+              </tr>
+            \`;
+          }).join('');
+
+          updateCountdowns();
+        }
+
+        async function toggleSourceStatus(id, currentStatus) {
+          const newStatus = currentStatus === 'active' ? 'paused' : 'active';
+          await fetch('/api/sources/' + id + '/status', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: newStatus })
+          });
+          notify('Source status changed to: ' + newStatus.toUpperCase());
+          fetchSources();
+        }
+
+        async function fetchCategories() {
+          const res = await fetch('/api/categories');
+          const categories = await res.json();
+          const selectEl = document.getElementById('source-category');
+          
+          let html = '<option value="">Select Category...</option>';
+          if (Array.isArray(categories)) {
+            html += categories.map(c => \`<option value="\${c.id}">\${c.name}</option>\`).join('');
+          }
+          html += '<option value="__NEW__">➕ Add Custom New Category...</option>';
+          selectEl.innerHTML = html;
+        }
+
+        function handleCategoryChange(select) {
+          const customGroup = document.getElementById('custom-category-group');
+          customGroup.style.display = select.value === '__NEW__' ? 'block' : 'none';
+        }
+
+        async function handleSourceSubmit(e) {
+          e.preventDefault();
+          const editId = document.getElementById('edit-source-id').value;
+          const name = document.getElementById('source-name').value;
+          const url = document.getElementById('source-url').value;
+          const type = document.getElementById('source-type').value || 'auto';
+          const min = parseInt(document.getElementById('source-min').value) || 0;
+          const sec = parseInt(document.getElementById('source-sec').value) || 0;
+          const checkIntervalSec = (min * 60) + sec;
+          let categoryId = document.getElementById('source-category').value;
+
+          if (categoryId === '__NEW__') {
+            const customName = document.getElementById('custom-category-name').value;
+            if (!customName) return notify('Please enter custom category name.');
+            const catRes = await fetch('/api/categories', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: customName })
+            });
+            const newCat = await catRes.json();
+            categoryId = newCat.id;
+          }
+
+          const method = editId ? 'PUT' : 'POST';
+          const endpoint = editId ? '/api/sources/' + editId : '/api/sources';
+
+          const res = await fetch(endpoint, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, url, type, categoryId, checkIntervalSec })
+          });
+
+          if (res.ok) {
+            notify(editId ? 'Source updated successfully!' : 'Source added successfully!');
+            resetForm();
+            fetchSources();
+            fetchCategories();
+          } else {
+            notify('Failed to save source.');
+          }
+        }
+
+        function editSource(id) {
+          const source = cachedSources.find(s => s.id === id);
+          if (!source) return;
+
+          document.getElementById('edit-source-id').value = source.id;
+          document.getElementById('source-name').value = source.name;
+          document.getElementById('source-url').value = source.url;
+          document.getElementById('source-type').value = source.type || 'auto';
+          
+          const totalSec = source.checkIntervalSec || 300;
+          document.getElementById('source-min').value = Math.floor(totalSec / 60);
+          document.getElementById('source-sec').value = totalSec % 60;
+          
+          if (source.categoryId) {
+            document.getElementById('source-category').value = source.categoryId;
+          }
+
+          document.getElementById('form-title').innerText = '✏️ Edit Source: ' + source.name;
+          document.getElementById('submit-btn').innerText = 'Save Source Changes';
+          document.getElementById('cancel-btn').style.display = 'inline-block';
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        function resetForm() {
+          document.getElementById('edit-source-id').value = '';
+          document.getElementById('source-name').value = '';
+          document.getElementById('source-url').value = '';
+          document.getElementById('source-min').value = 5;
+          document.getElementById('source-sec').value = 0;
+          document.getElementById('custom-category-group').style.display = 'none';
+          document.getElementById('form-title').innerText = '➕ Add New Source';
+          document.getElementById('submit-btn').innerText = '+ Add Source & Start Auto-Fetching';
+          document.getElementById('cancel-btn').style.display = 'none';
+        }
+
+        async function deleteSource(id) {
+          if (!confirm('Are you sure you want to delete this source? All associated event logs will be removed.')) return;
+          const res = await fetch('/api/sources/' + id, { method: 'DELETE' });
+          if (res.ok) {
+            notify('Source deleted!');
+            fetchSources();
+          } else {
+            notify('Failed to delete source.');
+          }
+        }
+
+        async function triggerSource(id) {
+          await fetch('/api/sources/' + id + '/trigger', { method: 'POST' });
+          notify('Fetch job triggered!');
+          fetchSources();
+          fetchEvents();
+        }
+
+        async function fetchSettings() {
+          const res = await fetch('/api/settings');
+          const settings = await res.json();
+
+          document.getElementById('telegram-enabled').checked = settings.telegramEnabled;
+          document.getElementById('telegram-chat-id').value = settings.telegramChatId || '';
+          document.getElementById('email-enabled').checked = settings.emailEnabled;
+          document.getElementById('recipient-email').value = settings.recipientEmail || '';
+          document.getElementById('notify-empty').checked = settings.notifyWhenEmpty || false;
+          document.getElementById('dedup-enabled').checked = settings.deduplicationEnabled ?? true;
+          document.getElementById('toast-enabled').checked = settings.showToastAlerts ?? true;
+
+          enableToastAlerts = settings.showToastAlerts ?? true;
+        }
+
+        async function saveSettings(e) {
+          e.preventDefault();
+          const telegramEnabled = document.getElementById('telegram-enabled').checked;
+          const telegramChatId = document.getElementById('telegram-chat-id').value;
+          const emailEnabled = document.getElementById('email-enabled').checked;
+          const recipientEmail = document.getElementById('recipient-email').value;
+          const notifyWhenEmpty = document.getElementById('notify-empty').checked;
+          const deduplicationEnabled = document.getElementById('dedup-enabled').checked;
+          const showToastAlerts = document.getElementById('toast-enabled').checked;
+
+          enableToastAlerts = showToastAlerts;
+
+          const res = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ telegramEnabled, telegramChatId, emailEnabled, recipientEmail, notifyWhenEmpty, deduplicationEnabled, showToastAlerts })
+          });
+
+          if (res.ok) {
+            notify('Settings saved successfully!');
+          } else {
+            notify('Failed to save settings.');
+          }
+        }
+
+        // Initial Load
+        fetchEvents();
+        populateFeedFilters();
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+app.listen(PORT, () => {
+  console.log(`================================================`);
+  console.log(`Market Sentinel Dashboard: http://localhost:${PORT}`);
+  console.log(`================================================`);
+});

@@ -1,0 +1,187 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SourceType {
+  rss
+  api
+  json
+  xml
+  html_article
+  html_listing
+}
+
+enum SourceStatus {
+  active
+  paused
+  error
+}
+
+enum NotifyMode {
+  immediate
+  digest
+}
+
+enum NotificationStatus {
+  sent
+  failed
+}
+
+model Category {
+  id        String     @id @default(uuid())
+  name      String     @unique
+  parentId  String?
+  parent    Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children  Category[] @relation("CategoryHierarchy")
+  sources   Source[]
+  events    Event[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@map("categories")
+}
+
+model Source {
+  id                  String       @id @default(uuid())
+  name                String
+  type                SourceType
+  url                 String
+  categoryId          String
+  category            Category     @relation(fields: [categoryId], references: [id])
+  checkIntervalSec    Int          @default(300)
+  status              SourceStatus @default(active)
+  lastSuccessAt       DateTime?
+  lastError           String?
+  consecutiveFailures Int          @default(0)
+  capabilities        Json         @default("{}")
+  authConfig          Json         @default("{}")
+  extractionConfig    Json         @default("{}")
+  notifyOnAll         Boolean      @default(false)
+  notifyMode          NotifyMode   @default(immediate)
+  digestWindowSec     Int          @default(300)
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+  events              Event[]
+  fetchLogs           FetchLog[]
+
+  @@map("sources")
+}
+
+model KeywordGroup {
+  id        String    @id @default(uuid())
+  name      String    @unique
+  keywords  Keyword[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@map("keyword_groups")
+}
+
+model Keyword {
+  id             String         @id @default(uuid())
+  term           String         @unique
+  keywordGroupId String
+  keywordGroup   KeywordGroup   @relation(fields: [keywordGroupId], references: [id])
+  eventKeywords  EventKeyword[]
+  createdAt      DateTime       @default(now())
+
+  @@map("keywords")
+}
+
+model Event {
+  id                String         @id @default(uuid())
+  sourceId          String
+  source            Source         @relation(fields: [sourceId], references: [id])
+  categoryId        String
+  category          Category       @relation(fields: [categoryId], references: [id])
+  title             String
+  subtitle          String?
+  author            String?
+  publishedAt       DateTime
+  description       String?
+  originalContent   String
+  directLink        String
+  contentHash       String
+  isRead            Boolean        @default(false)
+  isStarred         Boolean        @default(false)
+  isArchived        Boolean        @default(false)
+  documentGroupId   String?
+  versionNumber     Int            @default(1)
+  previousVersionId String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  eventKeywords     EventKeyword[]
+  attachments       Attachment[]
+  notifications     Notification[]
+
+  @@unique([sourceId, contentHash])
+  @@map("events")
+}
+
+model EventKeyword {
+  eventId   String
+  keywordId String
+  event     Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  keyword   Keyword  @relation(fields: [keywordId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([eventId, keywordId])
+  @@map("event_keywords")
+}
+
+model Attachment {
+  id        String   @id @default(uuid())
+  eventId   String
+  event     Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  type      String
+  url       String
+  title     String?
+  createdAt DateTime @default(now())
+
+  @@map("attachments")
+}
+
+model Notification {
+  id         String             @id @default(uuid())
+  eventId    String
+  event      Event              @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  channel    String
+  status     NotificationStatus
+  sentAt     DateTime           @default(now())
+  error      String?
+  rawPayload Json               @default("{}")
+
+  @@map("notifications")
+}
+
+model FetchLog {
+  id         String   @id @default(uuid())
+  sourceId   String
+  source     Source   @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  status     String
+  itemCount  Int      @default(0)
+  error      String?
+  durationMs Int
+  createdAt  DateTime @default(now())
+
+  @@map("fetch_logs")
+}
+
+model Settings {
+  id                   Int      @id @default(1)
+  telegramChatId       String?
+  recipientEmail       String?
+  telegramEnabled      Boolean  @default(true)
+  emailEnabled         Boolean  @default(true)
+  notifyWhenEmpty      Boolean  @default(false)
+  deduplicationEnabled Boolean  @default(true)
+  showToastAlerts      Boolean  @default(true)
+  updatedAt            DateTime @updatedAt
+
+  @@map("settings")
+}

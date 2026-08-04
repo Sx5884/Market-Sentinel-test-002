@@ -1,0 +1,8 @@
+{
+  "name": "market-sentinel-monorepo",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @market-sentinel/server dev",
+    "build": "pnpm -r build"
+  }
+}
